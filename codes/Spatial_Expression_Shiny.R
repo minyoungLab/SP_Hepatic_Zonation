@@ -1,0 +1,3792 @@
+############################################################
+# FINAL VERSION
+# SHINY API VERSION: 2026-11-17-v7-trajectory-consistency
+#
+# 8-SET SINGLE JOINT-MBR
+# Spatial Proteomics Protein Abundance Map
+#
+# INPUT:
+#   One DIA-NN report.parquet
+#
+# Sets:
+#   GF1-2
+#   GF1-3
+#   GF1-4
+#   GF1-6
+#   SPF1-2
+#   SPF1-3
+#   SPF1-4
+#   SPF1-6
+#
+# Major updates:
+#   1. report.parquet -> tibble 유지
+#   2. print(n = Inf) 오류 방지
+#   3. Run -> Set / ROI parsing QC
+#   4. PG.MaxLFQ aggregation = max()
+#   5. Gray/NA ROI automatic diagnosis
+#   6. Common color scale across sets
+#   7. Direct input/output path specification
+############################################################
+
+SPATIAL_EXPRESSION_SHINY_API <- "2026-11-17-v7-trajectory-consistency"
+SPATIAL_EXPRESSION_MULTI_TARGET_API <- TRUE
+SPATIAL_MAP_TRAJECTORY_PANEL_API <- TRUE
+SPATIAL_MAP_SAMPLE_LABEL_API <- TRUE
+SPATIAL_MAP_COMBINED_SAMPLE_HEADER_API <- TRUE
+SPATIAL_MAP_LEGEND_LAYOUT_API <- "two-line-protein-gene-v2"
+SPATIAL_MAP_SHINY_SPLIT_PANEL_API <- TRUE
+SPATIAL_MAP_TRAJECTORY_DATA_API <- "roi-metadata-global-robust-v1"
+
+
+############################################################
+# 0. Packages
+############################################################
+
+library(tidyverse)
+library(arrow)
+
+spatial_env_value <- function(name, default = "") {
+  value <- trimws(Sys.getenv(name, unset = ""))
+  if (nzchar(value)) value else default
+}
+
+spatial_env_flag <- function(name, default = TRUE) {
+  value <- tolower(spatial_env_value(name, if (isTRUE(default)) "true" else "false"))
+  value %in% c("1", "true", "t", "yes", "y")
+}
+
+
+############################################################
+# 1. USER SETTINGS
+############################################################
+
+# ----------------------------------------------------------
+# INPUT report.parquet
+#
+# ★ 실제 8-set joint-MBR report.parquet 경로로 변경
+# ----------------------------------------------------------
+
+input_file <- spatial_env_value(
+  "SPATIAL_MAP_INPUT_FILE",
+  paste0(
+    "//192.168.10.50/Shared/users/minyoung.song/1_DIA-NN/",
+    "20260828_Spatial_Mouse_Liver/",
+    "5_On_MBR_QC_filtered_Total/",
+    "3_Set1_2_T_GF_SPF/",
+    "report.parquet"
+  )
+)
+
+
+# ----------------------------------------------------------
+# OUTPUT ROOT
+#
+# ★ 원하는 output folder 직접 지정
+# ----------------------------------------------------------
+
+# report.parquet 파일 자체가 아니라 그 상위 폴더 아래에 결과를 생성합니다.
+# 예: C:/.../Data/report.parquet -> C:/.../Data/Spatial_Map
+output_root <- spatial_env_value(
+  "SPATIAL_MAP_OUTPUT_ROOT",
+  file.path(dirname(input_file), "Spatial_Map")
+)
+
+
+# ----------------------------------------------------------
+# Sets
+# ----------------------------------------------------------
+
+set_names <- c(
+  "GF1-2",
+  "GF1-3",
+  "GF1-4",
+  "GF1-6",
+  "SPF1-1",
+  "SPF1-2",
+  "SPF1-3",
+  "SPF1-4"
+)
+
+
+# ----------------------------------------------------------
+# 모든 set이 report.parquet에 반드시 존재해야 하는가?
+#
+# TRUE:
+#   8-set joint-MBR 최종 분석에 권장
+#
+# FALSE:
+#   현재 GF 4개만 시험 분석하는 경우 사용 가능
+# ----------------------------------------------------------
+
+require_all_sets <- spatial_env_flag("SPATIAL_MAP_REQUIRE_ALL_SETS", TRUE)
+
+
+# ----------------------------------------------------------
+# Target protein
+#
+# UniProt accession 또는 gene
+# ----------------------------------------------------------
+
+target_protein <- spatial_env_value("SPATIAL_MAP_TARGET", "Q05421")
+
+
+# ----------------------------------------------------------
+# DIA-NN protein abundance
+# ----------------------------------------------------------
+
+quantity_col <- "PG.MaxLFQ"
+
+
+# ----------------------------------------------------------
+# Abundance transform
+#
+# "log2"
+# "none"
+# ----------------------------------------------------------
+
+abundance_transform <- "log2"
+
+
+# ----------------------------------------------------------
+# Common color scale
+#
+# TRUE:
+# 모든 GF/SPF map이 동일 scale
+# ----------------------------------------------------------
+
+use_common_scale <- TRUE
+
+
+# ----------------------------------------------------------
+# QC에서 제외된 ROI
+#
+# 예:
+# "GF1-2" = c(5, 18)
+#
+# 제거할 ROI가 없으면 integer(0)
+# ----------------------------------------------------------
+
+exclude_roi <- list(
+  
+  "GF1-2"  = integer(0),
+  "GF1-3"  = integer(0),
+  "GF1-4"  = integer(0),
+  "GF1-6"  = integer(0),
+  
+  "SPF1-1" = integer(0),
+  "SPF1-2" = integer(0),
+  "SPF1-3" = integer(0),
+  "SPF1-4" = integer(0)
+  
+)
+
+
+# ----------------------------------------------------------
+# Histology image + spatial abundance overlay
+# ----------------------------------------------------------
+
+# TRUE이면 각 ROI abundance tile을 원본 조직 이미지의 실제 ROI 위치에
+# 직접 그려 최종 Spatial MAP PNG를 생성합니다.
+create_histology_overlay <- TRUE
+
+
+# ROI1, ROI8, ROI89, CV, PV 좌표표.
+# 기본값은 report.parquet와 같은 폴더의 CSV입니다.
+image_reference_file <- spatial_env_value(
+  "SPATIAL_MAP_COORDINATE_FILE",
+  file.path(dirname(input_file), "Image_Reference_coordinates.csv")
+)
+
+# ROI metadata generated by 01 Generation ROI metadata. Spatial_S in this file
+# is calculated from the actual CV/PV distances and must be used for every
+# trajectory instead of the sequential ROI number.
+roi_metadata_file <- spatial_env_value(
+  "SPATIAL_MAP_ROI_METADATA_FILE",
+  file.path(dirname(image_reference_file), "ROI_metadata.csv")
+)
+
+# When Continuous zonation has already been run, this file is the authoritative
+# source used by 01 Trajectory. Reusing it makes the GF/SPF curves numerically
+# identical between 01 Trajectory and 02 Spatial Map. Spatial Map still runs
+# without 01 Trajectory because this is a Continuous-analysis output.
+analysis_ready_file <- Sys.getenv(
+  "SPATIAL_MAP_ANALYSIS_READY_FILE",
+  unset = ""
+)
+
+
+# 8개 histology 이미지가 저장된 폴더.
+# 기본적으로 report.parquet와 같은 폴더에서
+# GF1-2.png, GF1-3.png, ..., SPF1-4.png를 자동 검색합니다.
+histology_image_root <- spatial_env_value(
+  "SPATIAL_MAP_HISTOLOGY_ROOT",
+  dirname(input_file)
+)
+
+# 자동 검색할 확장자
+histology_image_extensions <- c(
+  "png", "jpg", "jpeg", "tif", "tiff"
+)
+
+
+# 원본 이미지의 가로세로 비율을 유지하면서 긴 변을 아래 크기로 맞춥니다.
+# 첨부 예시와 비슷한 크기는 846, 고해상도 출력은 1600 이상을 권장합니다.
+overlay_tissue_long_edge_px <- 846L
+
+# 오른쪽 color legend 폭. Protein accession과 (Gene)이 두 줄로 표시되어도
+# 잘리지 않도록 기존 147 px보다 넓게 확보합니다.
+overlay_legend_width_px  <- 260L
+
+# 최종 Spatial Map PNG의 가로·세로 크기를 기존 출력의 50%로 축소합니다.
+# Histology overlay는 전체 합성 후 축소하여 ROI, 글자와 범례 비율을 유지합니다.
+spatial_map_output_scale <- 0.50
+
+# 기존 6 x 6 inch, 300 dpi(1800 x 1800 px) 출력을
+# 150 dpi(900 x 900 px)로 저장하여 가로·세로를 각각 절반으로 줄입니다.
+spatial_map_png_dpi <- 150L
+
+
+# 1 = ROI tile 완전 불투명, 값이 작을수록 조직이 더 비쳐 보입니다.
+overlay_tile_alpha <- 1.00
+
+# ROI 사이의 흰색 경계선 굵기
+overlay_border_lwd <- 1.5
+
+# 첨부된 실제 출력 이미지의 기존 ROI grid에서 다시 측정한
+# ROI01, ROI08, ROI89 중심 좌표입니다.
+# 이미지 크기가 달라도 동일 위치가 유지되도록 0-1 정규화 좌표를 사용합니다.
+overlay_anchor_calibration <- tribble(
+  ~Set,     ~ROI01_X_Norm, ~ROI01_Y_Norm, ~ROI08_X_Norm, ~ROI08_Y_Norm, ~ROI89_X_Norm, ~ROI89_Y_Norm,
+  "GF1-2",  0.31715976,    0.28368794,     0.68047337,     0.28368794,     0.31715976,     0.75118203,
+  "GF1-3",  0.27836879,    0.21862616,     0.65011820,     0.21862616,     0.27836879,     0.75429326,
+  "GF1-4",  0.21276596,    0.15158924,     0.69267139,     0.15158924,     0.21276596,     0.78667482,
+  "GF1-6",  0.26536643,    0.22919419,     0.66548463,     0.22919419,     0.26536643,     0.80779392,
+  "SPF1-1", 0.29071170,    0.27068558,     0.65440290,     0.27068558,     0.29071170,     0.72695035,
+  "SPF1-2", 0.35520095,    0.26054591,     0.70567376,     0.26054591,     0.35520095,     0.73387097,
+  "SPF1-3", 0.36111111,    0.15996785,     0.62293144,     0.15996785,     0.36111111,     0.61334405,
+  "SPF1-4", 0.30673759,    0.22452830,     0.67257683,     0.22452830,     0.30673759,     0.72327044
+)
+
+# 사용자가 요청한 대로 최종 그림에 CV/PV 표식을 추가하지 않습니다.
+overlay_show_cv_pv <- FALSE
+
+
+if(create_histology_overlay && !requireNamespace("magick", quietly = TRUE)){
+  stop(
+    paste0(
+      "\n조직 이미지 overlay 생성을 위해 R package 'magick'이 필요합니다.\n",
+      "install.packages(\"magick\") 실행 후 다시 분석하세요."
+    )
+  )
+}
+
+
+############################################################
+# 2. Output directory
+############################################################
+
+safe_protein <- gsub(
+  "[^A-Za-z0-9_-]",
+  "_",
+  target_protein
+)
+
+
+output_dir <- file.path(
+  output_root,
+  safe_protein
+)
+
+
+if(tolower(tools::file_ext(output_root)) == "parquet"){
+  stop(
+    paste0(
+      "\noutput_root가 parquet 파일로 지정되어 있습니다:\n",
+      output_root,
+      "\noutput_root에는 폴더 경로를 지정하세요."
+    )
+  )
+}
+
+
+if(file.exists(output_root) && !dir.exists(output_root)){
+  stop(
+    paste0(
+      "\noutput_root와 같은 이름의 파일이 존재합니다:\n",
+      output_root,
+      "\n다른 출력 폴더를 지정하세요."
+    )
+  )
+}
+
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+if(!dir.exists(output_dir)){
+  stop(
+    paste0(
+      "\n출력 폴더를 생성할 수 없습니다:\n",
+      output_dir,
+      "\n상위 폴더 경로와 쓰기 권한을 확인하세요."
+    )
+  )
+}
+
+
+############################################################
+# 3. Input check
+############################################################
+
+if(!file.exists(input_file)){
+  
+  stop(
+    paste0(
+      "\nreport.parquet 파일을 찾을 수 없습니다:\n",
+      input_file
+    )
+  )
+  
+}
+
+
+############################################################
+# 3-1. Read image reference coordinates
+############################################################
+
+coordinate_candidates <- unique(
+  c(
+    image_reference_file,
+    file.path(getwd(), basename(image_reference_file)),
+    file.path(dirname(input_file), basename(image_reference_file))
+  )
+)
+
+
+coordinate_existing <- coordinate_candidates[
+  file.exists(coordinate_candidates)
+]
+
+
+if(length(coordinate_existing) == 0){
+  stop(
+    paste0(
+      "\nImage reference coordinate 파일을 찾을 수 없습니다.\n",
+      "확인한 경로:\n",
+      paste(coordinate_candidates, collapse = "\n")
+    )
+  )
+}
+
+
+image_reference_file <- normalizePath(
+  coordinate_existing[[1]],
+  winslash = "/",
+  mustWork = TRUE
+)
+
+
+image_reference <- readr::read_csv(
+  image_reference_file,
+  show_col_types = FALSE
+) %>%
+  as_tibble()
+
+
+required_reference_columns <- c(
+  "Image", "Group", "Mouse", "Set",
+  "ROI01_X", "ROI01_Y",
+  "ROI08_X", "ROI08_Y",
+  "ROI89_X", "ROI89_Y",
+  "CV_X", "CV_Y",
+  "PV_X", "PV_Y"
+)
+
+
+missing_reference_columns <- setdiff(
+  required_reference_columns,
+  colnames(image_reference)
+)
+
+
+if(length(missing_reference_columns) > 0){
+  stop(
+    paste0(
+      "\nImage reference coordinate 파일에 필수 column이 없습니다:\n",
+      paste(missing_reference_columns, collapse = ", ")
+    )
+  )
+}
+
+
+coordinate_columns <- c(
+  "ROI01_X", "ROI01_Y",
+  "ROI08_X", "ROI08_Y",
+  "ROI89_X", "ROI89_Y",
+  "CV_X", "CV_Y",
+  "PV_X", "PV_Y"
+)
+
+
+image_reference <- image_reference %>%
+  mutate(
+    Set = as.character(Set),
+    Image = as.character(Image),
+    across(
+      all_of(coordinate_columns),
+      ~ suppressWarnings(as.numeric(.x))
+    )
+  )
+
+
+duplicate_reference_sets <- image_reference %>%
+  count(Set, name = "N") %>%
+  filter(N != 1)
+
+
+if(nrow(duplicate_reference_sets) > 0){
+  stop(
+    paste0(
+      "\n각 Set은 coordinate 파일에 정확히 한 행만 있어야 합니다:\n",
+      paste(
+        paste0(duplicate_reference_sets$Set, " (", duplicate_reference_sets$N, ")"),
+        collapse = ", "
+      )
+    )
+  )
+}
+
+
+missing_reference_sets <- setdiff(
+  set_names,
+  image_reference$Set
+)
+
+
+if(length(missing_reference_sets) > 0){
+  stop(
+    paste0(
+      "\n다음 Set의 image reference 좌표가 없습니다:\n",
+      paste(missing_reference_sets, collapse = ", ")
+    )
+  )
+}
+
+
+invalid_reference <- image_reference %>%
+  filter(Set %in% set_names) %>%
+  filter(
+    if_any(
+      all_of(coordinate_columns),
+      ~ !is.finite(.x)
+    )
+  )
+
+
+if(nrow(invalid_reference) > 0){
+  stop(
+    paste0(
+      "\n숫자로 변환할 수 없는 image coordinate가 있습니다: ",
+      paste(invalid_reference$Set, collapse = ", ")
+    )
+  )
+}
+
+
+write.csv(
+  image_reference %>%
+    filter(Set %in% set_names),
+  file.path(
+    output_dir,
+    "Image_Reference_coordinates_Used.csv"
+  ),
+  row.names = FALSE
+)
+
+
+############################################################
+# 4. Read report.parquet (한번 불러오고 나서는 제외)
+#
+# ★ as.data.frame() 사용하지 않음
+# ★ tibble로 유지
+############################################################
+
+cat("\n============================================\n")
+cat("READING DIA-NN REPORT.PARQUET\n")
+cat("============================================\n")
+
+
+report_cache_path <- normalizePath(
+  input_file,
+  winslash = "/",
+  mustWork = TRUE
+)
+
+report_file_info <- file.info(report_cache_path)
+
+report_cache <- get0(
+  ".spatial_map_report_cache",
+  envir = globalenv(),
+  inherits = FALSE
+)
+
+cache_is_valid <- is.list(report_cache) &&
+  identical(report_cache$path, report_cache_path) &&
+  identical(report_cache$size, unname(report_file_info$size[[1]])) &&
+  identical(report_cache$mtime, as.numeric(report_file_info$mtime[[1]])) &&
+  inherits(report_cache$report, "data.frame")
+
+if(cache_is_valid){
+
+  cat("\nUsing in-memory report.parquet cache.\n")
+  report <- report_cache$report
+
+} else {
+
+  report <- arrow::read_parquet(
+    report_cache_path
+  ) %>%
+    as_tibble()
+
+  assign(
+    ".spatial_map_report_cache",
+    list(
+      path = report_cache_path,
+      size = unname(report_file_info$size[[1]]),
+      mtime = as.numeric(report_file_info$mtime[[1]]),
+      report = report
+    ),
+    envir = globalenv()
+  )
+
+}
+
+
+cat(
+  "\nRows:",
+  nrow(report),
+  "\n"
+)
+
+cat(
+  "Columns:",
+  ncol(report),
+  "\n"
+)
+
+############################################################
+# 5. Required columns
+############################################################
+
+required_columns <- c(
+  "Run",
+  "Protein.Group",
+  quantity_col
+)
+
+
+missing_required <- setdiff(
+  required_columns,
+  colnames(report)
+)
+
+
+if(length(missing_required) > 0){
+  
+  stop(
+    paste0(
+      "\n필수 column이 없습니다:\n",
+      paste(
+        missing_required,
+        collapse = ", "
+      )
+    )
+  )
+  
+}
+
+
+############################################################
+# 6. Run name cleaning
+############################################################
+
+clean_run_name <- function(x){
+  
+  x <- as.character(x)
+  
+  x <- str_replace_all(
+    x,
+    "\\\\",
+    "/"
+  )
+  
+  x <- basename(x)
+  
+  x <- tools::file_path_sans_ext(x)
+  
+  x
+}
+
+
+############################################################
+# 7. Set-name normalization
+############################################################
+
+normalize_set_name <- function(x){
+  
+  toupper(
+    gsub(
+      "[^A-Za-z0-9]",
+      "",
+      x
+    )
+  )
+  
+}
+
+
+############################################################
+# 8. Set detection
+############################################################
+
+detect_set <- function(run_name){
+  
+  run_normalized <- normalize_set_name(
+    run_name
+  )
+  
+  
+  result <- rep(
+    NA_character_,
+    length(run_name)
+  )
+  
+  
+  for(sn in set_names){
+    
+    sn_normalized <- normalize_set_name(
+      sn
+    )
+    
+    
+    idx <- is.na(result) &
+      str_detect(
+        run_normalized,
+        fixed(
+          sn_normalized
+        )
+      )
+    
+    
+    result[idx] <- sn
+  }
+  
+  
+  result
+}
+
+
+############################################################
+# 9. ROI number extraction
+############################################################
+
+get_ROI_number <- function(x){
+  
+  
+  ##########################################################
+  # Priority 1
+  #
+  # ROI1
+  # ROI01
+  # ROI001
+  # ROI_1
+  # ROI-1
+  ##########################################################
+  
+  roi_match <- str_match(
+    
+    x,
+    
+    regex(
+      "ROI[_\\- ]*0*([0-9]{1,3})",
+      ignore_case = TRUE
+    )
+    
+  )[,2]
+  
+  
+  ##########################################################
+  # Priority 2
+  #
+  # 마지막 숫자
+  #
+  # GF1-2_025
+  ##########################################################
+  
+  trailing_match <- str_match(
+    
+    x,
+    
+    "0*([0-9]{1,3})$"
+    
+  )[,2]
+  
+  
+  result <- ifelse(
+    
+    !is.na(roi_match),
+    
+    roi_match,
+    
+    trailing_match
+    
+  )
+  
+  
+  suppressWarnings(
+    as.integer(
+      result
+    )
+  )
+}
+
+
+############################################################
+# 10. Build Run index
+############################################################
+
+run_index_all <- report %>%
+  
+  distinct(
+    Run
+  ) %>%
+  
+  mutate(
+    
+    Run_clean = clean_run_name(
+      Run
+    ),
+    
+    Set = detect_set(
+      Run_clean
+    ),
+    
+    ROI = get_ROI_number(
+      Run_clean
+    )
+    
+  ) %>%
+  
+  as_tibble()
+
+
+############################################################
+# 11. RUN PARSING QC
+############################################################
+
+cat("\n============================================\n")
+cat("RUN PARSING QC\n")
+cat("============================================\n")
+
+
+run_summary <- run_index_all %>%
+  
+  count(
+    Set,
+    name = "N_Run"
+  ) %>%
+  
+  as_tibble()
+
+
+print(
+  run_summary,
+  n = Inf
+)
+
+
+############################################################
+# 11-1. Unknown set
+############################################################
+
+unknown_run <- run_index_all %>%
+  
+  filter(
+    is.na(Set)
+  )
+
+
+if(nrow(unknown_run) > 0){
+  
+  cat(
+    "\n주의: Set을 인식하지 못한 Run이 있습니다:\n"
+  )
+  
+  print(
+    unknown_run %>%
+      select(
+        Run_clean
+      ) %>%
+      as_tibble(),
+    n = Inf
+  )
+  
+}
+
+
+############################################################
+# 11-2. ROI parsing failure
+############################################################
+
+roi_failed <- run_index_all %>%
+  
+  filter(
+    !is.na(Set),
+    is.na(ROI)
+  )
+
+
+if(nrow(roi_failed) > 0){
+  
+  cat(
+    "\n주의: ROI를 인식하지 못한 Run이 있습니다:\n"
+  )
+  
+  print(
+    roi_failed %>%
+      select(
+        Run_clean,
+        Set
+      ) %>%
+      as_tibble(),
+    n = Inf
+  )
+  
+}
+
+
+############################################################
+# 11-3. Valid Run index
+############################################################
+
+run_index <- run_index_all %>%
+  
+  filter(
+    
+    !is.na(Set),
+    
+    !is.na(ROI),
+    
+    ROI >= 1,
+    
+    ROI <= 96
+    
+  ) %>%
+  
+  as_tibble()
+
+
+############################################################
+# 12. Check all expected sets
+############################################################
+
+detected_sets <- unique(
+  run_index$Set
+)
+
+
+missing_sets <- setdiff(
+  set_names,
+  detected_sets
+)
+
+
+if(length(missing_sets) > 0){
+  
+  message(
+    "\n다음 set이 report.parquet에서 검출되지 않았습니다:\n",
+    paste(
+      missing_sets,
+      collapse = ", "
+    )
+  )
+  
+  
+  if(require_all_sets){
+    
+    stop(
+      "\nrequire_all_sets = TRUE이므로 분석을 중단합니다."
+    )
+  }
+  
+}
+
+
+############################################################
+# 13. Detailed Run -> ROI table
+#
+# ★ print(n = Inf) 오류 수정
+############################################################
+
+run_roi_check <- run_index %>%
+  
+  select(
+    
+    Run_clean,
+    
+    Set,
+    
+    ROI
+    
+  ) %>%
+  
+  arrange(
+    Set,
+    ROI
+  ) %>%
+  
+  as_tibble()
+
+
+cat("\n============================================\n")
+cat("RUN -> ROI CHECK\n")
+cat("============================================\n")
+
+
+print(
+  run_roi_check,
+  n = Inf
+)
+
+
+############################################################
+# 14. ROI duplicate / missing check
+############################################################
+
+roi_count <- run_index %>%
+  
+  count(
+    Set,
+    ROI,
+    name = "N_Run"
+  ) %>%
+  
+  arrange(
+    Set,
+    ROI
+  ) %>%
+  
+  as_tibble()
+
+
+cat("\n============================================\n")
+cat("ROI COUNT\n")
+cat("============================================\n")
+
+
+print(
+  roi_count,
+  n = Inf
+)
+
+
+############################################################
+# 15. Save Run parsing QC
+############################################################
+
+write.csv(
+  
+  run_roi_check,
+  
+  file.path(
+    output_dir,
+    "Run_ROI_Parsing_Check.csv"
+  ),
+  
+  row.names = FALSE
+  
+)
+
+
+write.csv(
+  
+  roi_count,
+  
+  file.path(
+    output_dir,
+    "Run_ROI_Count_Check.csv"
+  ),
+  
+  row.names = FALSE
+  
+)
+
+
+############################################################
+# 16. Protein metadata columns
+############################################################
+
+candidate_id_columns <- c(
+  
+  "Protein.Group",
+  
+  "Protein.Ids",
+  "Protein.IDs",
+  
+  "Genes",
+  "Gene",
+  
+  "Protein.Names",
+  "Protein.Name"
+  
+)
+
+
+id_columns <- intersect(
+  
+  candidate_id_columns,
+  
+  colnames(report)
+  
+)
+
+
+cat("\n============================================\n")
+cat("PROTEIN SEARCH COLUMNS\n")
+cat("============================================\n")
+
+
+print(
+  id_columns
+)
+
+
+############################################################
+# 17. Protein metadata
+############################################################
+
+protein_meta <- report %>%
+  
+  select(
+    all_of(
+      id_columns
+    )
+  ) %>%
+  
+  distinct() %>%
+  
+  as_tibble()
+
+
+############################################################
+# 18. Exact token matching
+############################################################
+
+token_match <- function(x, target){
+  
+  x <- as.character(x)
+  
+  x[
+    is.na(x)
+  ] <- ""
+  
+  
+  target <- toupper(
+    trimws(
+      target
+    )
+  )
+  
+  
+  x <- toupper(
+    x
+  )
+  
+  
+  vapply(
+    
+    strsplit(
+      x,
+      "[;,|]"
+    ),
+    
+    function(z){
+      
+      any(
+        trimws(z) == target
+      )
+      
+    },
+    
+    logical(1)
+    
+  )
+}
+
+
+############################################################
+# 19. Search target protein
+############################################################
+
+meta_match <- rep(
+  FALSE,
+  nrow(protein_meta)
+)
+
+
+for(col in id_columns){
+  
+  meta_match <- meta_match |
+    
+    token_match(
+      
+      protein_meta[[col]],
+      
+      target_protein
+      
+    )
+  
+}
+
+
+matched_meta <- protein_meta[
+  meta_match,
+  ,
+  drop = FALSE
+] %>%
+  
+  as_tibble()
+
+
+if(nrow(matched_meta) == 0){
+  
+  stop(
+    paste0(
+      "\nTarget protein을 찾을 수 없습니다: ",
+      target_protein
+    )
+  )
+  
+}
+
+
+cat("\n============================================\n")
+cat("TARGET PROTEIN\n")
+cat("============================================\n")
+
+
+cat(
+  "Target:",
+  target_protein,
+  "\n"
+)
+
+
+print(
+  matched_meta,
+  n = Inf
+)
+
+
+############################################################
+# 20. Matched Protein.Group
+############################################################
+
+matched_groups <- unique(
+  matched_meta$Protein.Group
+)
+matched_groups <- trimws(as.character(matched_groups))
+matched_groups <- matched_groups[!is.na(matched_groups) & nzchar(matched_groups)]
+
+if(length(matched_groups) == 0L){
+  stop(
+    paste0(
+      "Target '", target_protein,
+      "'에 대응하는 유효한 Protein.Group을 찾을 수 없습니다."
+    )
+  )
+}
+
+if(length(matched_groups) > 1L){
+  stop(
+    paste0(
+      "Target '", target_protein,
+      "'이 여러 Protein.Group과 일치합니다: ",
+      paste(matched_groups, collapse = ", "),
+      ". 01 Trajectory와 동일한 단백질을 사용하려면 UniProt accession 하나를 입력하세요."
+    )
+  )
+}
+
+matched_group <- matched_groups[[1]]
+
+
+############################################################
+# 20-1. Display label: UniProt accession (Gene name)
+############################################################
+
+split_metadata_tokens <- function(x){
+  values <- unlist(
+    strsplit(
+      as.character(x[!is.na(x)]),
+      "[;,|]"
+    ),
+    use.names = FALSE
+  )
+  values <- trimws(values)
+  unique(values[nzchar(values)])
+}
+
+matched_accessions <- split_metadata_tokens(matched_groups)
+target_upper <- toupper(trimws(target_protein))
+accession_match <- matched_accessions[
+  toupper(matched_accessions) == target_upper
+]
+primary_accession <- if(length(accession_match)){
+  accession_match[[1]]
+} else if(length(matched_accessions)){
+  matched_accessions[[1]]
+} else {
+  trimws(target_protein)
+}
+
+gene_columns <- intersect(c("Genes", "Gene"), names(matched_meta))
+matched_genes <- if(length(gene_columns)){
+  unique(unlist(lapply(gene_columns, function(column){
+    split_metadata_tokens(matched_meta[[column]])
+  }), use.names = FALSE))
+} else {
+  character()
+}
+matched_genes <- matched_genes[nzchar(matched_genes)]
+primary_gene <- if(length(matched_genes)) matched_genes[[1]] else NA_character_
+
+protein_display_label <- if(
+  !is.na(primary_gene) &&
+  nzchar(primary_gene) &&
+  toupper(primary_gene) != toupper(primary_accession)
+){
+  paste0(primary_accession, " (", primary_gene, ")")
+} else {
+  primary_accession
+}
+
+protein_legend_label <- if(
+  !is.na(primary_gene) &&
+  nzchar(primary_gene) &&
+  toupper(primary_gene) != toupper(primary_accession)
+){
+  paste0(primary_accession, "\n(", primary_gene, ")")
+} else {
+  primary_accession
+}
+
+cat("Display label:", protein_display_label, "\n")
+
+
+cat("\nMatched Protein.Group:\n")
+
+print(
+  matched_groups
+)
+
+
+############################################################
+# 21. Extract target protein
+############################################################
+
+optional_columns <- intersect(
+  
+  c(
+    "Genes",
+    "Protein.Ids",
+    "Precursor.Normalised",
+    "Precursor.Quantity",
+    "Q.Value",
+    "PG.Q.Value",
+    "Global.PG.Q.Value",
+    "PG.MaxLFQ.Quality"
+  ),
+  
+  colnames(report)
+  
+)
+
+
+target_report <- report %>%
+  
+  filter(
+    Protein.Group %in% matched_groups
+  ) %>%
+  
+  select(
+    
+    Run,
+    
+    Protein.Group,
+    
+    all_of(
+      quantity_col
+    ),
+    
+    all_of(
+      optional_columns
+    )
+    
+  ) %>%
+  
+  left_join(
+    
+    run_index %>%
+      select(
+        Run,
+        Run_clean,
+        Set,
+        ROI
+      ),
+    
+    by = "Run"
+    
+  ) %>%
+  
+  filter(
+    
+    !is.na(Set),
+    
+    !is.na(ROI),
+    
+    ROI >= 1,
+    
+    ROI <= 96
+    
+  ) %>%
+  
+  mutate(
+    
+    Quantity = suppressWarnings(
+      as.numeric(
+        .data[[quantity_col]]
+      )
+    )
+    
+  ) %>%
+  
+  as_tibble()
+
+
+############################################################
+# 22. Optional precursor values for diagnostics
+############################################################
+
+if("Precursor.Normalised" %in% colnames(target_report)){
+  
+  target_report <- target_report %>%
+    
+    mutate(
+      
+      Precursor_Normalised_Check =
+        suppressWarnings(
+          as.numeric(
+            `Precursor.Normalised`
+          )
+        )
+      
+    )
+  
+} else {
+  
+  target_report <- target_report %>%
+    
+    mutate(
+      Precursor_Normalised_Check = NA_real_
+    )
+  
+}
+
+
+if("Precursor.Quantity" %in% colnames(target_report)){
+  
+  target_report <- target_report %>%
+    
+    mutate(
+      
+      Precursor_Quantity_Check =
+        suppressWarnings(
+          as.numeric(
+            `Precursor.Quantity`
+          )
+        )
+      
+    )
+  
+} else {
+  
+  target_report <- target_report %>%
+    
+    mutate(
+      Precursor_Quantity_Check = NA_real_
+    )
+  
+}
+
+
+############################################################
+# 23. Safe max function
+#
+# PG.MaxLFQ:
+# 동일 Run + Protein.Group에서 반복될 수 있으므로
+# max 사용
+############################################################
+
+safe_max <- function(x){
+  
+  x <- suppressWarnings(
+    as.numeric(
+      x
+    )
+  )
+  
+  
+  x <- x[
+    is.finite(x)
+  ]
+  
+  
+  if(length(x) == 0){
+    
+    return(
+      NA_real_
+    )
+    
+  }
+  
+  
+  max(x)
+}
+
+
+############################################################
+# 24. Protein abundance per Run
+############################################################
+
+target_run_group <- target_report %>%
+  
+  group_by(
+    
+    Set,
+    
+    Run_clean,
+    
+    ROI,
+    
+    Protein.Group
+    
+  ) %>%
+  
+  summarise(
+    
+    Abundance_raw = safe_max(
+      Quantity
+    ),
+    
+    .groups = "drop"
+    
+  ) %>%
+  
+  as_tibble()
+
+
+############################################################
+# 25. If multiple matched Protein.Groups
+############################################################
+
+target_run <- target_run_group %>%
+  
+  group_by(
+    
+    Set,
+    
+    Run_clean,
+    
+    ROI
+    
+  ) %>%
+  
+  summarise(
+    
+    Abundance_raw = {
+      
+      x <- Abundance_raw
+      
+      x <- x[
+        is.finite(x)
+      ]
+      
+      
+      if(length(x) == 0){
+        
+        NA_real_
+        
+      } else {
+        
+        mean(x)
+        
+      }
+      
+    },
+    
+    .groups = "drop"
+    
+  ) %>%
+  
+  as_tibble()
+
+
+############################################################
+# 26. QC excluded ROI table
+############################################################
+
+excluded_table <- tibble(
+  
+  Set = character(),
+  
+  ROI = integer()
+  
+)
+
+
+for(sn in names(exclude_roi)){
+  
+  if(length(exclude_roi[[sn]]) > 0){
+    
+    excluded_table <- bind_rows(
+      
+      excluded_table,
+      
+      tibble(
+        
+        Set = sn,
+        
+        ROI = as.integer(
+          exclude_roi[[sn]]
+        )
+        
+      )
+      
+    )
+    
+  }
+  
+}
+
+
+############################################################
+# 27. Remove QC excluded ROIs
+############################################################
+
+if(nrow(excluded_table) > 0){
+  
+  target_run <- target_run %>%
+    
+    anti_join(
+      
+      excluded_table,
+      
+      by = c(
+        "Set",
+        "ROI"
+      )
+      
+    )
+  
+}
+
+
+############################################################
+# 28. Transform abundance
+############################################################
+
+if(abundance_transform == "log2"){
+  
+  target_run <- target_run %>%
+    
+    mutate(
+      
+      Abundance = ifelse(
+        
+        is.na(Abundance_raw),
+        
+        NA_real_,
+        
+        log2(
+          Abundance_raw + 1
+        )
+        
+      )
+      
+    )
+  
+} else if(abundance_transform == "none"){
+  
+  target_run <- target_run %>%
+    
+    mutate(
+      Abundance = Abundance_raw
+    )
+  
+} else {
+  
+  stop(
+    "abundance_transform은 'log2' 또는 'none'만 가능합니다."
+  )
+  
+}
+
+
+############################################################
+# 29. Same ROI averaging
+############################################################
+
+target_roi <- target_run %>%
+  
+  group_by(
+    
+    Set,
+    
+    ROI
+    
+  ) %>%
+  
+  summarise(
+    
+    N_Run = sum(
+      !is.na(
+        Abundance
+      )
+    ),
+    
+    Abundance = {
+      
+      x <- Abundance
+      
+      x <- x[
+        is.finite(x)
+      ]
+      
+      
+      if(length(x) == 0){
+        
+        NA_real_
+        
+      } else {
+        
+        mean(x)
+        
+      }
+      
+    },
+    
+    .groups = "drop"
+    
+  ) %>%
+  
+  as_tibble()
+
+
+############################################################
+# 30. ROI spatial coordinates
+############################################################
+
+roi_coord <- bind_rows(
+  
+  
+  ##########################################################
+  # ROI 1-8
+  ##########################################################
+  
+  tibble(
+    
+    ROI = 1:8,
+    
+    X = 2:9,
+    
+    Y = 1
+    
+  ),
+  
+  
+  ##########################################################
+  # ROI 9-88
+  ##########################################################
+  
+  tibble(
+    
+    ROI = 9:88,
+    
+    X = rep(
+      1:10,
+      times = 8
+    ),
+    
+    Y = rep(
+      2:9,
+      each = 10
+    )
+    
+  ),
+  
+  
+  ##########################################################
+  # ROI 89-96
+  ##########################################################
+  
+  tibble(
+    
+    ROI = 89:96,
+    
+    X = 2:9,
+    
+    Y = 10
+    
+  )
+  
+)
+
+
+############################################################
+# 31. Generate protein maps
+############################################################
+
+protein_map_list <- list()
+
+
+for(sn in set_names){
+  
+  
+  set_data <- target_roi %>%
+    
+    filter(
+      Set == sn
+    ) %>%
+    
+    select(
+      
+      ROI,
+      
+      N_Run,
+      
+      Abundance
+      
+    )
+  
+  
+  protein_map <- roi_coord %>%
+    
+    left_join(
+      
+      set_data,
+      
+      by = "ROI"
+      
+    ) %>%
+    
+    mutate(
+      Set = sn
+    ) %>%
+    
+    arrange(
+      ROI
+    ) %>%
+    
+    as_tibble()
+  
+  
+  protein_map_list[[sn]] <- protein_map
+  
+  
+  cat(
+    "\n",
+    sn,
+    ": ",
+    sum(
+      !is.na(
+        protein_map$Abundance
+      )
+    ),
+    " / 96 ROI with abundance",
+    sep = ""
+  )
+  
+}
+
+
+############################################################
+# 32. Combined map
+############################################################
+
+combined_map <- bind_rows(
+  protein_map_list
+) %>%
+  as_tibble()
+
+
+############################################################
+# 33. GRAY / NA ROI DIAGNOSTICS
+############################################################
+
+cat("\n\n============================================\n")
+cat("GRAY / NA ROI DIAGNOSTICS\n")
+cat("============================================\n")
+
+
+############################################################
+# 33-1. Number of mapped runs
+############################################################
+
+run_presence <- run_index %>%
+  
+  count(
+    
+    Set,
+    
+    ROI,
+    
+    name = "N_Mapped_Run"
+    
+  )
+
+
+############################################################
+# 33-2. Target protein presence
+############################################################
+
+target_presence <- target_report %>%
+  
+  group_by(
+    
+    Set,
+    
+    ROI
+    
+  ) %>%
+  
+  summarise(
+    
+    N_Target_Rows = n(),
+    
+    N_PGMaxLFQ =
+      sum(
+        is.finite(
+          Quantity
+        )
+      ),
+    
+    N_Precursor_Normalised =
+      sum(
+        is.finite(
+          Precursor_Normalised_Check
+        )
+      ),
+    
+    N_Precursor_Quantity =
+      sum(
+        is.finite(
+          Precursor_Quantity_Check
+        )
+      ),
+    
+    .groups = "drop"
+    
+  )
+
+
+############################################################
+# 33-3. Full Set x ROI grid
+############################################################
+
+diagnostic_grid <- expand_grid(
+  
+  Set = set_names,
+  
+  ROI = 1:96
+  
+)
+
+
+############################################################
+# 33-4. Mark excluded ROI
+############################################################
+
+excluded_flag <- excluded_table %>%
+  
+  mutate(
+    QC_Excluded = TRUE
+  )
+
+
+############################################################
+# 33-5. Combine diagnostics
+############################################################
+
+gray_diagnostic <- diagnostic_grid %>%
+  
+  left_join(
+    
+    run_presence,
+    
+    by = c(
+      "Set",
+      "ROI"
+    )
+    
+  ) %>%
+  
+  left_join(
+    
+    target_presence,
+    
+    by = c(
+      "Set",
+      "ROI"
+    )
+    
+  ) %>%
+  
+  left_join(
+    
+    excluded_flag,
+    
+    by = c(
+      "Set",
+      "ROI"
+    )
+    
+  ) %>%
+  
+  left_join(
+    
+    combined_map %>%
+      
+      select(
+        Set,
+        ROI,
+        Abundance
+      ),
+    
+    by = c(
+      "Set",
+      "ROI"
+    )
+    
+  ) %>%
+  
+  mutate(
+    
+    N_Mapped_Run =
+      replace_na(
+        N_Mapped_Run,
+        0L
+      ),
+    
+    N_Target_Rows =
+      replace_na(
+        N_Target_Rows,
+        0L
+      ),
+    
+    N_PGMaxLFQ =
+      replace_na(
+        N_PGMaxLFQ,
+        0L
+      ),
+    
+    N_Precursor_Normalised =
+      replace_na(
+        N_Precursor_Normalised,
+        0L
+      ),
+    
+    N_Precursor_Quantity =
+      replace_na(
+        N_Precursor_Quantity,
+        0L
+      ),
+    
+    QC_Excluded =
+      replace_na(
+        QC_Excluded,
+        FALSE
+      )
+    
+  ) %>%
+  
+  mutate(
+    
+    Status = case_when(
+      
+      QC_Excluded ~
+        "QC excluded",
+      
+      N_Mapped_Run == 0 ~
+        "NO RUN mapped to this ROI",
+      
+      N_Target_Rows == 0 ~
+        "Target protein row absent",
+      
+      N_PGMaxLFQ == 0 &
+        N_Precursor_Normalised > 0 ~
+        "PG.MaxLFQ = NA, but Precursor.Normalised exists",
+      
+      N_PGMaxLFQ == 0 &
+        N_Precursor_Quantity > 0 ~
+        "PG.MaxLFQ = NA, but Precursor.Quantity exists",
+      
+      N_PGMaxLFQ == 0 ~
+        "Target row exists, but PG.MaxLFQ is NA",
+      
+      is.na(Abundance) ~
+        "Abundance became NA after processing",
+      
+      TRUE ~
+        "OK"
+      
+    )
+    
+  ) %>%
+  
+  arrange(
+    Set,
+    ROI
+  ) %>%
+  
+  as_tibble()
+
+
+############################################################
+# 34. Print only problematic ROIs
+############################################################
+
+problem_roi <- gray_diagnostic %>%
+  
+  filter(
+    Status != "OK"
+  )
+
+
+if(nrow(problem_roi) > 0){
+  
+  print(
+    problem_roi,
+    n = Inf
+  )
+  
+} else {
+  
+  cat(
+    "\n문제 ROI 없음: 모든 ROI에서 abundance가 확인되었습니다.\n"
+  )
+  
+}
+
+
+############################################################
+# 35. Save diagnostic tables
+############################################################
+
+write.csv(
+  
+  gray_diagnostic,
+  
+  file.path(
+    output_dir,
+    paste0(
+      safe_protein,
+      "_ROI_Diagnostic_All.csv"
+    )
+  ),
+  
+  row.names = FALSE
+  
+)
+
+
+write.csv(
+  
+  problem_roi,
+  
+  file.path(
+    output_dir,
+    paste0(
+      safe_protein,
+      "_ROI_Diagnostic_Problems.csv"
+    )
+  ),
+  
+  row.names = FALSE
+  
+)
+
+
+############################################################
+# 36. Common color range
+############################################################
+
+valid_abundance <- combined_map$Abundance[
+  
+  is.finite(
+    combined_map$Abundance
+  )
+  
+]
+
+
+if(length(valid_abundance) == 0){
+  
+  stop(
+    "\n모든 abundance 값이 NA입니다."
+  )
+  
+}
+
+
+global_min <- min(
+  valid_abundance
+)
+
+global_max <- max(
+  valid_abundance
+)
+
+
+if(global_min == global_max){
+  
+  delta <- max(
+    abs(global_min) * 0.01,
+    0.01
+  )
+  
+  global_min <- global_min - delta
+  
+  global_max <- global_max + delta
+  
+}
+
+
+common_limits <- c(
+  
+  global_min,
+  
+  global_max
+  
+)
+
+
+cat("\n============================================\n")
+cat("GLOBAL COLOR SCALE\n")
+cat("============================================\n")
+
+
+cat(
+  "Minimum:",
+  global_min,
+  "\n"
+)
+
+cat(
+  "Maximum:",
+  global_max,
+  "\n"
+)
+
+
+############################################################
+# 37. Legend
+############################################################
+
+legend_title <- ifelse(
+  
+  abundance_transform == "log2",
+  
+  "log2(PG.MaxLFQ + 1)",
+  
+  quantity_col
+  
+)
+
+
+############################################################
+# 38. Fill scale
+############################################################
+
+make_fill_scale <- function(){
+  
+  if(use_common_scale){
+    
+    scale_fill_viridis_c(
+      
+      option = "magma",
+      
+      limits = common_limits,
+      
+      oob = scales::squish,
+      
+      na.value = "grey90"
+      
+    )
+    
+  } else {
+    
+    scale_fill_viridis_c(
+      
+      option = "magma",
+      
+      na.value = "grey90"
+      
+    )
+    
+  }
+  
+}
+
+
+############################################################
+# 38-1. Histology overlay helper functions
+############################################################
+
+resolve_histology_path <- function(set_name, image_name = set_name){
+
+  search_roots <- unique(
+    c(
+      histology_image_root,
+      dirname(input_file),
+      getwd()
+    )
+  )
+
+  search_roots <- search_roots[
+    dir.exists(search_roots)
+  ]
+
+  base_names <- unique(
+    c(
+      as.character(set_name),
+      as.character(image_name)
+    )
+  )
+
+  direct_candidates <- unlist(
+    lapply(
+      search_roots,
+      function(root){
+        unlist(
+          lapply(
+            base_names,
+            function(base_name){
+              file.path(
+                root,
+                paste0(base_name, ".", histology_image_extensions)
+              )
+            }
+          ),
+          use.names = FALSE
+        )
+      }
+    ),
+    use.names = FALSE
+  )
+
+  existing <- direct_candidates[
+    file.exists(direct_candidates)
+  ]
+
+  if(length(existing) == 0){
+
+    all_images <- unlist(
+      lapply(
+        search_roots,
+        function(root){
+          list.files(
+            root,
+            pattern = paste0(
+              "\\.(",
+              paste(histology_image_extensions, collapse = "|"),
+              ")$"
+            ),
+            full.names = TRUE,
+            ignore.case = TRUE
+          )
+        }
+      ),
+      use.names = FALSE
+    )
+
+    if(length(all_images) > 0){
+
+      file_stems <- tools::file_path_sans_ext(
+        basename(all_images)
+      )
+
+      normalized_stems <- normalize_set_name(file_stems)
+      normalized_targets <- normalize_set_name(base_names)
+
+      matched_index <- which(
+        vapply(
+          normalized_stems,
+          function(stem){
+            any(
+              stem %in% normalized_targets |
+              startsWith(stem, normalized_targets)
+            )
+          },
+          logical(1)
+        )
+      )
+
+      if(length(matched_index) > 0){
+        existing <- all_images[matched_index]
+      }
+
+    }
+
+  }
+
+  if(length(existing) == 0){
+    return(NA_character_)
+  }
+
+  normalizePath(
+    existing[[1]],
+    winslash = "/",
+    mustWork = TRUE
+  )
+}
+
+
+make_abundance_colors <- function(values, limits, alpha = 1){
+
+  palette_magma <- viridisLite::magma(256)
+
+  color_function <- scales::col_numeric(
+    palette = palette_magma,
+    domain = limits,
+    na.color = "grey90"
+  )
+
+  colors <- color_function(values)
+
+  grDevices::adjustcolor(
+    colors,
+    alpha.f = alpha
+  )
+}
+
+
+make_overlay_legend <- function(
+  limits,
+  width_px,
+  height_px,
+  legend_label,
+  protein_label
+){
+
+  palette_magma <- viridisLite::magma(256)
+
+  legend_image <- magick::image_graph(
+    width = width_px,
+    height = height_px,
+    bg = "#FFFFFF",
+    res = 96
+  )
+
+  legend_device <- grDevices::dev.cur()
+
+  on.exit({
+    open_devices <- grDevices::dev.list()
+    if(!is.null(open_devices) && legend_device %in% open_devices){
+      grDevices::dev.off(legend_device)
+    }
+  }, add = TRUE)
+
+  par(
+    mar = c(5, 0.5, 9.5, 5.2),
+    bg = "#FFFFFF",
+    fg = "black",
+    col.axis = "black",
+    col.lab = "black",
+    col.main = "black"
+  )
+
+  plot.new()
+
+  plot.window(
+    xlim = c(0, 1),
+    ylim = limits,
+    xaxs = "i",
+    yaxs = "i"
+  )
+
+  legend_raster <- as.raster(
+    matrix(
+      rev(palette_magma),
+      ncol = 1
+    )
+  )
+
+  rasterImage(
+    legend_raster,
+    xleft = 0.18,
+    ybottom = limits[[1]],
+    xright = 0.52,
+    ytop = limits[[2]],
+    interpolate = TRUE
+  )
+
+  axis(
+    side = 4,
+    at = pretty(limits, n = 5),
+    pos = 0.55,
+    las = 1,
+    col = "black",
+    col.ticks = "black",
+    col.axis = "black",
+    cex.axis = 0.75
+  )
+
+  mtext(
+    legend_label,
+    side = 4,
+    line = 3.1,
+    col = "black",
+    cex = 0.75
+  )
+
+  # Draw accession and gene on two explicit lines. Using mtext instead of
+  # title(main=...) prevents the second line from being clipped after the
+  # complete Spatial Map is reduced to its final display size.
+  protein_label_lines <- strsplit(
+    as.character(protein_label), "\n", fixed = TRUE
+  )[[1]]
+  protein_label_lines <- protein_label_lines[nzchar(protein_label_lines)]
+  if(length(protein_label_lines) >= 1L){
+    mtext(
+      protein_label_lines[[1]], side = 3, line = 5.2,
+      col = "black", cex = 0.84, font = 2
+    )
+  }
+  if(length(protein_label_lines) >= 2L){
+    mtext(
+      protein_label_lines[[2]], side = 3, line = 3.7,
+      col = "black", cex = 0.78, font = 2
+    )
+  }
+
+  grDevices::dev.off(legend_device)
+
+  legend_image
+}
+
+
+create_spatial_histology_overlay <- function(
+  protein_map,
+  set_name,
+  histology_path,
+  reference_row,
+  anchor_row,
+  output_file
+){
+
+  histology_image <- magick::image_read(histology_path)
+
+  tissue_image <- magick::image_resize(
+    histology_image,
+    geometry = paste0(
+      overlay_tissue_long_edge_px,
+      "x",
+      overlay_tissue_long_edge_px
+    )
+  )
+
+  resized_information <- magick::image_info(tissue_image)
+
+  resized_width <- resized_information$width[[1]]
+  resized_height <- resized_information$height[[1]]
+
+  if(nrow(anchor_row) != 1){
+    stop(
+      paste0(
+        set_name,
+        ": 실제 ROI grid 보정값이 정확히 한 행이어야 합니다."
+      )
+    )
+  }
+
+  # Coordinate CSV values are retained for audit and ROI numbering.
+  reference_roi01_x <- reference_row$ROI01_X[[1]]
+  reference_roi01_y <- reference_row$ROI01_Y[[1]]
+
+  reference_horizontal_x <- (
+    reference_row$ROI08_X[[1]] - reference_roi01_x
+  ) / 7
+
+  reference_horizontal_y <- (
+    reference_row$ROI08_Y[[1]] - reference_roi01_y
+  ) / 7
+
+  reference_vertical_x <- (
+    reference_row$ROI89_X[[1]] - reference_roi01_x
+  ) / 9
+
+  reference_vertical_y <- (
+    reference_row$ROI89_Y[[1]] - reference_roi01_y
+  ) / 9
+
+  # The attached output figures were measured again at the visible ROI grid.
+  # Normalized anchors are converted to the current resized image size, so the
+  # alignment remains correct even when the output resolution changes.
+  pixel_roi01_x <- anchor_row$ROI01_X_Norm[[1]] * resized_width
+  pixel_roi01_y <- anchor_row$ROI01_Y_Norm[[1]] * resized_height
+
+  pixel_roi08_x <- anchor_row$ROI08_X_Norm[[1]] * resized_width
+  pixel_roi08_y <- anchor_row$ROI08_Y_Norm[[1]] * resized_height
+
+  pixel_roi89_x <- anchor_row$ROI89_X_Norm[[1]] * resized_width
+  pixel_roi89_y <- anchor_row$ROI89_Y_Norm[[1]] * resized_height
+
+  horizontal_x <- (pixel_roi08_x - pixel_roi01_x) / 7
+  horizontal_y <- (pixel_roi08_y - pixel_roi01_y) / 7
+
+  vertical_x <- (pixel_roi89_x - pixel_roi01_x) / 9
+  vertical_y <- (pixel_roi89_y - pixel_roi01_y) / 9
+
+  horizontal_length <- sqrt(
+    horizontal_x^2 + horizontal_y^2
+  )
+
+  vertical_length <- sqrt(
+    vertical_x^2 + vertical_y^2
+  )
+
+  if(
+    !is.finite(horizontal_length) ||
+    !is.finite(vertical_length) ||
+    horizontal_length <= 0 ||
+    vertical_length <= 0
+  ){
+    stop(
+      paste0(
+        set_name,
+        ": ROI1, ROI8, ROI89 좌표로 ROI 간격을 계산할 수 없습니다."
+      )
+    )
+  }
+
+  # ROI01 = Row 1 / Column 2.
+  # ROI08 defines the horizontal vector and ROI89 defines the vertical vector.
+  # The normalized anchors preserve image-specific translation and cell size.
+
+  finite_abundance <- protein_map$Abundance[
+    is.finite(protein_map$Abundance)
+  ]
+
+  if(length(finite_abundance) == 0){
+    warning(
+      set_name,
+      ": 유효한 abundance 값이 없어 모든 ROI를 NA 색상으로 표시합니다."
+    )
+  }
+
+  overlay_limits <- if(
+    use_common_scale ||
+    length(finite_abundance) == 0
+  ){
+    common_limits
+  } else {
+    range(finite_abundance)
+  }
+
+  if(overlay_limits[[1]] == overlay_limits[[2]]){
+    overlay_limits <- overlay_limits + c(-0.01, 0.01)
+  }
+
+  registration_table <- protein_map %>%
+    mutate(
+      Reference_Center_X =
+        reference_roi01_x +
+        (X - 2) * reference_horizontal_x +
+        (Y - 1) * reference_vertical_x,
+      Reference_Center_Y =
+        reference_roi01_y +
+        (X - 2) * reference_horizontal_y +
+        (Y - 1) * reference_vertical_y,
+      Pixel_Center_X =
+        pixel_roi01_x +
+        (X - 2) * horizontal_x +
+        (Y - 1) * vertical_x,
+      Pixel_Center_Y =
+        pixel_roi01_y +
+        (X - 2) * horizontal_y +
+        (Y - 1) * vertical_y,
+      Corner1_X = Pixel_Center_X - horizontal_x / 2 - vertical_x / 2,
+      Corner1_Y = Pixel_Center_Y - horizontal_y / 2 - vertical_y / 2,
+      Corner2_X = Pixel_Center_X + horizontal_x / 2 - vertical_x / 2,
+      Corner2_Y = Pixel_Center_Y + horizontal_y / 2 - vertical_y / 2,
+      Corner3_X = Pixel_Center_X + horizontal_x / 2 + vertical_x / 2,
+      Corner3_Y = Pixel_Center_Y + horizontal_y / 2 + vertical_y / 2,
+      Corner4_X = Pixel_Center_X - horizontal_x / 2 + vertical_x / 2,
+      Corner4_Y = Pixel_Center_Y - horizontal_y / 2 + vertical_y / 2,
+      Tile_Color = make_abundance_colors(
+        Abundance,
+        limits = overlay_limits,
+        alpha = overlay_tile_alpha
+      )
+    ) %>%
+    arrange(ROI) %>%
+    as_tibble()
+
+  tissue_overlay <- magick::image_draw(tissue_image)
+
+  overlay_device <- grDevices::dev.cur()
+
+  on.exit({
+    open_devices <- grDevices::dev.list()
+    if(!is.null(open_devices) && overlay_device %in% open_devices){
+      grDevices::dev.off(overlay_device)
+    }
+  }, add = TRUE)
+
+  for(i in seq_len(nrow(registration_table))){
+
+    polygon(
+      x = c(
+        registration_table$Corner1_X[[i]],
+        registration_table$Corner2_X[[i]],
+        registration_table$Corner3_X[[i]],
+        registration_table$Corner4_X[[i]]
+      ),
+      y = c(
+        registration_table$Corner1_Y[[i]],
+        registration_table$Corner2_Y[[i]],
+        registration_table$Corner3_Y[[i]],
+        registration_table$Corner4_Y[[i]]
+      ),
+      col = registration_table$Tile_Color[[i]],
+      border = "white",
+      lwd = overlay_border_lwd
+    )
+
+  }
+
+  grDevices::dev.off(overlay_device)
+
+  legend_image <- make_overlay_legend(
+    limits = overlay_limits,
+    width_px = overlay_legend_width_px,
+    height_px = resized_height,
+    legend_label = legend_title,
+    protein_label = protein_legend_label
+  )
+
+  final_image <- magick::image_append(
+    c(
+      tissue_overlay,
+      legend_image
+    ),
+    stack = FALSE
+  )
+
+  final_image <- magick::image_resize(
+    final_image,
+    geometry = paste0(round(spatial_map_output_scale * 100), "%")
+  )
+
+  registration_export <- registration_table
+  output_coordinate_columns <- grep(
+    "^(Pixel_Center|Corner[1-4])_[XY]$",
+    names(registration_export),
+    value = TRUE
+  )
+  registration_export[output_coordinate_columns] <- lapply(
+    registration_export[output_coordinate_columns],
+    function(value) value * spatial_map_output_scale
+  )
+
+  magick::image_write(
+    final_image,
+    path = output_file,
+    format = "png"
+  )
+
+  write.csv(
+    registration_export %>%
+      select(
+        Set,
+        ROI,
+        X,
+        Y,
+        Abundance,
+        Reference_Center_X,
+        Reference_Center_Y,
+        Pixel_Center_X,
+        Pixel_Center_Y,
+        Corner1_X,
+        Corner1_Y,
+        Corner2_X,
+        Corner2_Y,
+        Corner3_X,
+        Corner3_Y,
+        Corner4_X,
+        Corner4_Y,
+        Tile_Color
+      ),
+    sub(
+      "\\.png$",
+      "_ROI_Registration.csv",
+      output_file,
+      ignore.case = TRUE
+    ),
+    row.names = FALSE
+  )
+
+  invisible(output_file)
+}
+
+
+############################################################
+# 39. Plot function
+############################################################
+
+make_spatial_plot <- function(
+    
+  protein_map,
+  
+  set_name,
+  
+  show_roi = TRUE
+  
+){
+  
+  
+  p <- ggplot(
+    
+    protein_map,
+    
+    aes(
+      
+      x = X,
+      
+      y = Y,
+      
+      fill = Abundance
+      
+    )
+    
+  )
+  
+  
+  if(show_roi){
+    
+    p <- p +
+      
+      geom_tile(
+        
+        width = 0.94,
+        
+        height = 0.94,
+        
+        color = "grey30",
+        
+        linewidth = 0.4
+        
+      ) +
+      
+      geom_text(
+        
+        aes(
+          label = ROI
+        ),
+        
+        size = 3
+        
+      )
+    
+  } else {
+    
+    p <- p +
+      
+      geom_tile(
+        
+        width = 0.98,
+        
+        height = 0.98,
+        
+        color = "white",
+        
+        linewidth = 0.3
+        
+      )
+    
+  }
+  
+  
+  p <- p +
+    
+    scale_y_reverse() +
+    
+    make_fill_scale() +
+    
+    coord_fixed() +
+    
+    labs(
+      
+      title = protein_legend_label,
+      
+      subtitle = set_name,
+      
+      x = NULL,
+      
+      y = NULL,
+      
+      fill = legend_title
+      
+    ) +
+    
+    theme_void() +
+    
+    theme(
+      
+      plot.title = element_text(
+        
+        hjust = 0.5,
+        
+        face = "bold",
+        
+        size = 16
+        
+      ),
+      
+      plot.subtitle = element_text(
+        
+        hjust = 0.5,
+        
+        face = "bold",
+        
+        size = 12
+        
+      ),
+
+      legend.position = "right",
+      plot.background = element_rect(fill = "#FFFFFF", color = NA),
+      panel.background = element_rect(fill = "#FFFFFF", color = NA),
+      legend.background = element_rect(fill = "#FFFFFF", color = NA),
+      legend.box.background = element_rect(fill = "#FFFFFF", color = NA),
+      legend.key = element_rect(fill = "#FFFFFF", color = NA)
+      
+    )
+  
+  
+  p
+}
+
+
+############################################################
+# 39-1. CV-to-PV trajectory and raster panel helpers
+#
+# The already extracted target_roi table is reused here. The report.parquet
+# file is not read again for individual samples or group panels.
+############################################################
+
+trajectory_source <- NULL
+
+if(nzchar(analysis_ready_file) && file.exists(analysis_ready_file)){
+  analysis_ready_file <- normalizePath(
+    analysis_ready_file, winslash = "/", mustWork = TRUE
+  )
+  analysis_ready <- readr::read_csv(
+    analysis_ready_file, show_col_types = FALSE
+  ) %>% as_tibble()
+  required_trajectory_columns <- c(
+    "Group", "Set", "Protein.Group", "Spatial_S", "RobustScaled"
+  )
+  missing_trajectory_columns <- setdiff(
+    required_trajectory_columns, names(analysis_ready)
+  )
+  if(length(missing_trajectory_columns)){
+    stop(
+      paste0(
+        basename(analysis_ready_file), "에 trajectory 필수 열이 없습니다: ",
+        paste(missing_trajectory_columns, collapse = ", ")
+      )
+    )
+  }
+
+  trajectory_plot_data <- analysis_ready %>%
+    transmute(
+      Group = toupper(trimws(as.character(Group))),
+      Set = as.character(Set),
+      Protein.Group = trimws(as.character(Protein.Group)),
+      Spatial_S = suppressWarnings(as.numeric(Spatial_S)),
+      RobustScaled = suppressWarnings(as.numeric(RobustScaled))
+    ) %>%
+    filter(
+      Protein.Group == matched_group,
+      Set %in% set_names,
+      Group %in% c("GF", "SPF"),
+      is.finite(Spatial_S),
+      Spatial_S >= 0,
+      Spatial_S <= 1,
+      is.finite(RobustScaled)
+    ) %>%
+    as_tibble()
+
+  if(!nrow(trajectory_plot_data)){
+    stop(
+      paste0(
+        "Continuous analysis-ready data에서 Protein.Group '",
+        matched_group,
+        "'의 trajectory 값을 찾을 수 없습니다. 01 Trajectory와 동일한 target인지 확인하세요."
+      )
+    )
+  }
+  trajectory_source <- "Spatial_Proteomics_AnalysisReady.csv"
+} else {
+  if(!file.exists(roi_metadata_file)){
+    stop(
+      paste0(
+        "ROI metadata 파일을 찾을 수 없습니다: ", roi_metadata_file,
+        "\n01 Generation ROI metadata를 다시 실행하세요."
+      )
+    )
+  }
+  roi_metadata_file <- normalizePath(
+    roi_metadata_file, winslash = "/", mustWork = TRUE
+  )
+  roi_metadata <- readr::read_csv(
+    roi_metadata_file, show_col_types = FALSE
+  ) %>% as_tibble()
+  required_roi_metadata <- c("Group", "Set", "ROI", "Spatial_S")
+  missing_roi_metadata <- setdiff(required_roi_metadata, names(roi_metadata))
+  if(length(missing_roi_metadata)){
+    stop(
+      paste0(
+        basename(roi_metadata_file), "에 필수 열이 없습니다: ",
+        paste(missing_roi_metadata, collapse = ", ")
+      )
+    )
+  }
+
+  trajectory_metadata <- roi_metadata %>%
+    transmute(
+      Group = toupper(trimws(as.character(Group))),
+      Set = as.character(Set),
+      ROI = suppressWarnings(as.integer(
+        sub(".*?([0-9]+)$", "\\1", as.character(ROI), perl = TRUE)
+      )),
+      Spatial_S = suppressWarnings(as.numeric(Spatial_S))
+    ) %>%
+    filter(
+      Group %in% c("GF", "SPF"),
+      Set %in% set_names,
+      !is.na(ROI),
+      is.finite(Spatial_S),
+      Spatial_S >= 0,
+      Spatial_S <= 1
+    ) %>%
+    distinct(Set, ROI, .keep_all = TRUE)
+
+  # Reproduce Continuous zonation preprocessing exactly:
+  # log2(PG.MaxLFQ), followed by protein-wise global median/IQR scaling across
+  # all retained GF and SPF ROIs. No sample-wise scaling and no imputation.
+  trajectory_plot_data <- target_run %>%
+    select(Set, ROI, Abundance_raw) %>%
+    left_join(trajectory_metadata, by = c("Set", "ROI")) %>%
+    mutate(
+      Log2Abundance = ifelse(
+        is.finite(Abundance_raw) & Abundance_raw > 0,
+        log2(Abundance_raw),
+        NA_real_
+      )
+    )
+
+  protein_median <- stats::median(
+    trajectory_plot_data$Log2Abundance, na.rm = TRUE
+  )
+  protein_iqr <- stats::IQR(
+    trajectory_plot_data$Log2Abundance, na.rm = TRUE, type = 7
+  )
+  if(!is.finite(protein_iqr) || protein_iqr <= 0){
+    stop(
+      paste0(
+        matched_group,
+        ": 전체 ROI에서 log2 abundance IQR이 0이어서 trajectory를 계산할 수 없습니다."
+      )
+    )
+  }
+  trajectory_plot_data <- trajectory_plot_data %>%
+    mutate(
+      Protein.Group = matched_group,
+      RobustScaled = (Log2Abundance - protein_median) / protein_iqr
+    ) %>%
+    filter(
+      Group %in% c("GF", "SPF"),
+      is.finite(Spatial_S),
+      is.finite(RobustScaled)
+    ) %>%
+    as_tibble()
+  trajectory_source <- "ROI_metadata.csv + report.parquet"
+}
+
+if(!all(c("GF", "SPF") %in% unique(trajectory_plot_data$Group))){
+  stop("Trajectory data에 GF와 SPF가 모두 존재해야 합니다.")
+}
+
+readr::write_csv(
+  trajectory_plot_data,
+  file.path(output_dir, paste0(safe_protein, "_Trajectory_Observations.csv"))
+)
+readr::write_csv(
+  tibble(
+    Protein_Group = matched_group,
+    Source = trajectory_source,
+    Spatial_Coordinate = "ROI metadata d_CV / (d_CV + d_PV)",
+    Scaling = "Global protein-wise (log2 abundance - median) / IQR",
+    N_Observations = nrow(trajectory_plot_data),
+    N_GF = sum(trajectory_plot_data$Group == "GF"),
+    N_SPF = sum(trajectory_plot_data$Group == "SPF")
+  ),
+  file.path(output_dir, paste0(safe_protein, "_Trajectory_Source_Audit.csv"))
+)
+
+cat("\nTrajectory source:", trajectory_source, "\n")
+cat("Trajectory Protein.Group:", matched_group, "\n")
+
+fit_spatial_trajectory_curve <- function(plot_data, span = 0.60,
+                                         n_predict = 200L){
+  plot_data <- plot_data %>%
+    filter(is.finite(Spatial_S), is.finite(RobustScaled))
+
+  if(nrow(plot_data) < 10 || n_distinct(plot_data$Spatial_S) < 5){
+    return(tibble(Spatial_S = numeric(), Predicted = numeric()))
+  }
+
+  fit <- tryCatch(
+    suppressWarnings(
+      stats::loess(
+        RobustScaled ~ Spatial_S,
+        data = plot_data,
+        span = span,
+        degree = 2,
+        na.action = stats::na.exclude,
+        control = stats::loess.control(surface = "direct")
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  if(is.null(fit)){
+    return(tibble(Spatial_S = numeric(), Predicted = numeric()))
+  }
+
+  grid <- tibble(
+    Spatial_S = seq(
+      min(plot_data$Spatial_S),
+      max(plot_data$Spatial_S),
+      length.out = n_predict
+    )
+  )
+  grid$Predicted <- suppressWarnings(
+    as.numeric(stats::predict(fit, newdata = grid))
+  )
+  grid %>% filter(is.finite(Predicted))
+}
+
+make_spatial_trajectory_plot <- function(plot_data, panel_name, group_name){
+  curve <- fit_spatial_trajectory_curve(plot_data)
+  plot_color <- if(identical(group_name, "GF")) "#D95F76" else "#386CB0"
+  legend_value <- panel_name
+  plot_data <- plot_data %>% mutate(Panel = legend_value)
+  curve <- curve %>% mutate(Panel = legend_value)
+
+  p <- ggplot(
+    plot_data,
+    aes(x = Spatial_S, y = RobustScaled, color = Panel)
+  ) +
+    geom_point(size = 1.1, alpha = 0.18) +
+    scale_color_manual(
+      name = if(grepl("-All", panel_name, fixed = TRUE)) "Group" else "Sample",
+      values = stats::setNames(plot_color, legend_value)
+    ) +
+    scale_x_continuous(
+      limits = c(0, 1),
+      breaks = c(0, 0.25, 0.5, 0.75, 1),
+      labels = c("CV", "0.25", "0.50", "0.75", "PV"),
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    geom_vline(
+      xintercept = 0.5,
+      linetype = "dotted",
+      linewidth = 0.35,
+      color = "grey65"
+    ) +
+    labs(
+      title = paste0(panel_name, " · ", protein_display_label),
+      subtitle = "CV → PV spatial trajectory",
+      x = "Spatial ratio S",
+      y = "Robust-scaled protein abundance",
+      color = NULL
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 10),
+      axis.title = element_text(size = 10),
+      axis.text = element_text(size = 9),
+      plot.margin = margin(10, 12, 10, 10),
+      plot.background = element_rect(fill = "#FFFFFF", color = NA),
+      legend.background = element_rect(fill = "#FFFFFF", color = NA),
+      legend.key = element_rect(fill = "#FFFFFF", color = NA)
+    )
+
+  if(nrow(curve) >= 2){
+    p <- p + geom_line(
+      data = curve,
+      aes(x = Spatial_S, y = Predicted, color = Panel),
+      inherit.aes = FALSE,
+      linewidth = 1.05,
+      alpha = 0.95
+    )
+  }
+
+  p
+}
+
+fit_png_to_cell <- function(path, width, height){
+  if(is.na(path) || !nzchar(path) || !file.exists(path)){
+    return(magick::image_blank(width = width, height = height, color = "white"))
+  }
+  image <- magick::image_read(path)
+  image <- magick::image_resize(image, paste0(width, "x", height))
+  magick::image_extent(
+    image,
+    geometry = paste0(width, "x", height),
+    gravity = "center",
+    color = "white"
+  )
+}
+
+compose_png_grid <- function(paths, ncol = 2L, cell_width = 920L,
+                             cell_height = 680L, labels = NULL,
+                             label_height = 64L){
+  paths <- as.character(paths)
+  if(!length(paths)){
+    return(magick::image_blank(
+      width = cell_width * ncol,
+      height = cell_height,
+      color = "white"
+    ))
+  }
+  if(is.null(labels)){
+    labels <- rep(NA_character_, length(paths))
+  } else {
+    labels <- as.character(labels)
+    if(length(labels) != length(paths)){
+      stop("compose_png_grid: labels 길이는 paths 길이와 같아야 합니다.")
+    }
+  }
+
+  nrow_grid <- ceiling(length(paths) / ncol)
+  paths <- c(paths, rep(NA_character_, nrow_grid * ncol - length(paths)))
+  labels <- c(labels, rep(NA_character_, nrow_grid * ncol - length(labels)))
+
+  rows <- lapply(seq_len(nrow_grid), function(row_index){
+    indices <- ((row_index - 1L) * ncol + 1L):(row_index * ncol)
+    cells <- lapply(indices, function(index){
+      label <- labels[[index]]
+      has_label <- !is.na(label) && nzchar(trimws(label))
+      image_height <- if(has_label) cell_height - label_height else cell_height
+      image_height <- max(1L, image_height)
+      image_cell <- fit_png_to_cell(
+        paths[[index]], width = cell_width, height = image_height
+      )
+      if(!has_label) return(image_cell)
+
+      header <- magick::image_blank(
+        width = cell_width,
+        height = label_height,
+        color = "#0153A5"
+      )
+      header <- magick::image_annotate(
+        header,
+        text = trimws(label),
+        gravity = "center",
+        color = "white",
+        size = 34,
+        weight = 700
+      )
+      magick::image_append(c(header, image_cell), stack = TRUE)
+    })
+    magick::image_append(Reduce(c, cells), stack = FALSE)
+  })
+  magick::image_append(Reduce(c, rows), stack = TRUE)
+}
+
+
+############################################################
+# 40. Generate plots
+############################################################
+
+p1_list <- list()
+p2_list <- list()
+trajectory_png_paths <- stats::setNames(
+  rep(NA_character_, length(set_names)), set_names
+)
+spatial_overlay_paths <- stats::setNames(
+  rep(NA_character_, length(set_names)), set_names
+)
+
+
+for(sn in set_names){
+  
+  
+  protein_map <- protein_map_list[[sn]]
+  
+  
+  p1 <- make_spatial_plot(
+    
+    protein_map = protein_map,
+    
+    set_name = sn,
+    
+    show_roi = TRUE
+    
+  )
+  
+  
+  p2 <- make_spatial_plot(
+    
+    protein_map = protein_map,
+    
+    set_name = sn,
+    
+    show_roi = FALSE
+    
+  )
+  
+  
+  p1_list[[sn]] <- p1
+  p2_list[[sn]] <- p2
+  
+  
+  safe_set <- gsub(
+    
+    "[^A-Za-z0-9_-]",
+    
+    "_",
+    
+    sn
+    
+  )
+
+
+  ##########################################################
+  # Sample trajectory (axes and legend retained)
+  ##########################################################
+
+  sample_trajectory_data <- trajectory_plot_data %>% filter(Set == sn)
+  if(nrow(sample_trajectory_data) > 0){
+    sample_group <- unique(sample_trajectory_data$Group)[[1]]
+    sample_trajectory_plot <- make_spatial_trajectory_plot(
+      sample_trajectory_data,
+      panel_name = sn,
+      group_name = sample_group
+    )
+    trajectory_png_paths[[sn]] <- file.path(
+      output_dir,
+      paste0(safe_set, "_", safe_protein, "_Trajectory.png")
+    )
+    ggsave(
+      trajectory_png_paths[[sn]],
+      sample_trajectory_plot,
+      width = 7.2,
+      height = 5.2,
+      dpi = spatial_map_png_dpi,
+      bg = "#FFFFFF"
+    )
+  }
+  
+  
+  ##########################################################
+  # ROI map
+  ##########################################################
+  
+  ggsave(
+    
+    filename = file.path(
+      
+      output_dir,
+      
+      paste0(
+        safe_set,
+        "_",
+        safe_protein,
+        "_Spatial_Map_ROI.png"
+      )
+      
+    ),
+    
+    plot = p1,
+    
+    width = 6,
+    
+    height = 6,
+    
+    dpi = spatial_map_png_dpi,
+
+    bg = "#FFFFFF"
+    
+  )
+  
+  
+  ##########################################################
+  # Publication map
+  ##########################################################
+  
+  ggsave(
+    
+    filename = file.path(
+      
+      output_dir,
+      
+      paste0(
+        safe_set,
+        "_",
+        safe_protein,
+        "_Spatial_Map_Publication.png"
+      )
+      
+    ),
+    
+    plot = p2,
+    
+    width = 6,
+    
+    height = 6,
+    
+    dpi = spatial_map_png_dpi,
+
+    bg = "#FFFFFF"
+    
+  )
+
+
+  ##########################################################
+  # Histology + ROI abundance overlay
+  ##########################################################
+
+  if(create_histology_overlay){
+
+    reference_row <- image_reference %>%
+      filter(Set == sn) %>%
+      slice_head(n = 1)
+
+    anchor_row <- overlay_anchor_calibration %>%
+      filter(Set == sn) %>%
+      slice_head(n = 1)
+
+    histology_path <- resolve_histology_path(
+      set_name = sn,
+      image_name = reference_row$Image[[1]]
+    )
+
+    if(is.na(histology_path)){
+
+      stop(
+        paste0(
+          sn,
+          ": 조직 이미지 파일을 찾을 수 없습니다.\n",
+          "검색 폴더: ",
+          histology_image_root,
+          "\n예상 파일명: ",
+          sn,
+          ".png"
+        )
+      )
+
+    } else {
+
+      overlay_output_file <- file.path(
+        output_dir,
+        paste0(
+          safe_set,
+          "_",
+          safe_protein,
+          "_Spatial_MAP.png"
+        )
+      )
+
+      create_spatial_histology_overlay(
+        protein_map = protein_map,
+        set_name = sn,
+        histology_path = histology_path,
+        reference_row = reference_row,
+        anchor_row = anchor_row,
+        output_file = overlay_output_file
+      )
+
+      spatial_overlay_paths[[sn]] <- overlay_output_file
+
+      cat(
+        "\nHistology overlay generated: ",
+        overlay_output_file,
+        "\n",
+        sep = ""
+      )
+
+    }
+
+  }
+  
+  
+  ##########################################################
+  # Map data
+  ##########################################################
+  
+  write.csv(
+    
+    protein_map,
+    
+    file.path(
+      
+      output_dir,
+      
+      paste0(
+        safe_set,
+        "_",
+        safe_protein,
+        "_Spatial_Map_Data.csv"
+      )
+      
+    ),
+    
+    row.names = FALSE
+    
+  )
+  
+}
+
+
+############################################################
+# 40-1. GF/SPF trajectory + Spatial Map combined panels
+#
+# Each source PNG is fitted inside a padded cell without cropping. Therefore
+# every trajectory axis and every Spatial Map color legend remains visible.
+############################################################
+
+for(group_name in c("GF", "SPF")){
+  group_sets <- set_names[
+    grepl(paste0("^", group_name), set_names, ignore.case = TRUE)
+  ]
+  group_sets <- group_sets[
+    group_sets %in% unique(trajectory_plot_data$Set)
+  ]
+
+  if(!length(group_sets)) next
+
+  group_data <- trajectory_plot_data %>% filter(Set %in% group_sets)
+  group_panel_name <- paste0(group_name, "-All (", length(group_sets), " samples)")
+  group_plot <- make_spatial_trajectory_plot(
+    group_data,
+    panel_name = group_panel_name,
+    group_name = group_name
+  )
+  group_trajectory_path <- file.path(
+    output_dir,
+    paste0(safe_protein, "_", group_name, "_All_Trajectory.png")
+  )
+  ggsave(
+    group_trajectory_path,
+    group_plot,
+    width = 14.4,
+    height = 5.2,
+    dpi = spatial_map_png_dpi,
+    bg = "#FFFFFF"
+  )
+
+  trajectory_header <- fit_png_to_cell(
+    group_trajectory_path,
+    width = 1840L,
+    height = 680L
+  )
+  trajectory_samples <- compose_png_grid(
+    trajectory_png_paths[group_sets],
+    ncol = 2L,
+    cell_width = 920L,
+    cell_height = 680L
+  )
+  trajectory_column <- magick::image_append(
+    c(trajectory_header, trajectory_samples),
+    stack = TRUE
+  )
+
+  # Save the trajectory-only composite separately. The Shiny app places this
+  # image in the left column and renders each histology Spatial Map as its own
+  # titled card in the right 2 x 2 grid.
+  trajectory_panel_path <- file.path(
+    output_dir,
+    paste0(safe_protein, "_", group_name, "_Trajectory_Combined.png")
+  )
+  magick::image_write(
+    magick::image_border(
+      trajectory_column,
+      color = "white",
+      geometry = "12x12"
+    ),
+    trajectory_panel_path,
+    format = "png"
+  )
+
+  spatial_column <- compose_png_grid(
+    spatial_overlay_paths[group_sets],
+    ncol = 2L,
+    cell_width = 920L,
+    cell_height = 680L
+  )
+
+  trajectory_info <- magick::image_info(trajectory_column)
+  spatial_info <- magick::image_info(spatial_column)
+  panel_height <- max(trajectory_info$height[[1]], spatial_info$height[[1]])
+  trajectory_column <- magick::image_extent(
+    trajectory_column,
+    paste0(trajectory_info$width[[1]], "x", panel_height),
+    gravity = "center",
+    color = "white"
+  )
+  spatial_column <- magick::image_extent(
+    spatial_column,
+    paste0(spatial_info$width[[1]], "x", panel_height),
+    gravity = "center",
+    color = "white"
+  )
+
+  combined_panel <- magick::image_append(
+    c(trajectory_column, spatial_column),
+    stack = FALSE
+  )
+  combined_panel <- magick::image_border(
+    combined_panel,
+    color = "white",
+    geometry = "24x24"
+  )
+
+  combined_panel_path <- file.path(
+    output_dir,
+    paste0(
+      safe_protein,
+      "_",
+      group_name,
+      "_Trajectory_SpatialMap_Combined.png"
+    )
+  )
+  magick::image_write(combined_panel, combined_panel_path, format = "png")
+
+  cat(
+    "\nCombined trajectory + Spatial Map panel generated: ",
+    combined_panel_path,
+    "\n",
+    sep = ""
+  )
+}
+
+
+############################################################
+# 41. Combined ROI abundance table
+############################################################
+
+combined_wide <- combined_map %>%
+  
+  select(
+    
+    Set,
+    
+    ROI,
+    
+    Abundance
+    
+  ) %>%
+  
+  pivot_wider(
+    
+    names_from = Set,
+    
+    values_from = Abundance
+    
+  ) %>%
+  
+  arrange(
+    ROI
+  )
+
+
+############################################################
+# 42. Save combined data
+############################################################
+
+write.csv(
+  
+  combined_map,
+  
+  file.path(
+    
+    output_dir,
+    
+    paste0(
+      safe_protein,
+      "_AllSets_Spatial_Map_Long.csv"
+    )
+    
+  ),
+  
+  row.names = FALSE
+  
+)
+
+
+write.csv(
+  
+  combined_wide,
+  
+  file.path(
+    
+    output_dir,
+    
+    paste0(
+      safe_protein,
+      "_AllSets_ROI_Abundance_Wide.csv"
+    )
+    
+  ),
+  
+  row.names = FALSE
+  
+)
+
+
+############################################################
+# 43. Display figures
+############################################################
+
+for(sn in set_names){
+  
+  print(
+    p1_list[[sn]]
+  )
+  
+  print(
+    p2_list[[sn]]
+  )
+  
+}
+
+
+############################################################
+# 44. Final summary
+############################################################
+
+cat("\n\n============================================\n")
+cat("SPATIAL MAPPING COMPLETE\n")
+cat("============================================\n")
+
+
+cat(
+  "\nInput file:\n",
+  input_file,
+  "\n"
+)
+
+
+cat(
+  "\nTarget protein (display label):\n",
+  protein_display_label,
+  "\n"
+)
+
+
+cat(
+  "\nQuantity column:\n",
+  quantity_col,
+  "\n"
+)
+
+
+cat(
+  "\nTransform:\n",
+  abundance_transform,
+  "\n"
+)
+
+
+cat(
+  "\nCommon color scale:\n",
+  use_common_scale,
+  "\n"
+)
+
+
+cat(
+  "\nOutput directory:\n",
+  output_dir,
+  "\n"
+)
+
+
+cat(
+  "\nImage reference coordinates:\n",
+  image_reference_file,
+  "\n"
+)
+
+
+cat(
+  "\nHistology image root:\n",
+  histology_image_root,
+  "\n"
+)
+
+
+cat(
+  "\nProblem ROI number:",
+  nrow(problem_roi),
+  "\n"
+)
+
+
+cat("\nGenerated QC files:\n")
+
+cat(
+  "Run_ROI_Parsing_Check.csv\n"
+)
+
+cat(
+  "Run_ROI_Count_Check.csv\n"
+)
+
+cat(
+  paste0(
+    safe_protein,
+    "_ROI_Diagnostic_All.csv\n"
+  )
+)
+
+cat(
+  paste0(
+    safe_protein,
+    "_ROI_Diagnostic_Problems.csv\n"
+  )
+)
+
+
+cat("\n============================================\n")
