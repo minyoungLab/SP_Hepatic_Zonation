@@ -6,6 +6,11 @@ The analytical framework applies a linear mixed-effects model incorporating samp
 
 Although currently configured for CV→PV spatial zonation analysis in GF and SPF mouse livers, the application can be readily adapted to other tissues by adjusting the ROI parsing rules and analysis settings to investigate how spatial organization drives changes in biological function.
 
+# Demo
+If you would like to view the live application, please visit the following webpage:
+
+(https://sp-hepatic-zonation.shinyapps.io/SP-liver/)
+
 ## License
 
 MIT License. See `LICENSE` for details.
