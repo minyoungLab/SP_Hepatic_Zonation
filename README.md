@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1457686276.svg)](https://doi.org/10.5281/zenodo.24304896)
+
 # Interactive Spatial Proteomics Analysis of Hepatic CV–PV Zonation
 
 This R Shiny-based spatial bioimage analysis platform integrates quality control (QC), group comparison, hepatic lobule central vein-to-portal vein (CV→PV) zonation, protein trajectory analysis, and histology-based spatial mapping into a unified workflow for spatial proteomics data from germ-free (GF) and specific pathogen-free (SPF) mouse liver tissues. By automatically registering region of interest (ROI) coordinates on histological images with mass spectrometry-based protein quantification data, the platform visualizes spatial protein expression patterns in image form.
