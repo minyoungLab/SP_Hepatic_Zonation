@@ -21,4 +21,5 @@ MIT License. See `LICENSE` for details.
 
 Please cite the Zenodo:
 
-> C. [https://10.5281/zenodo.24304897].
+> minyoungLab/SP_Hepatic_Zonation: Interactive Spatial Proteomics Analysis of Hepatic CV–PV Zonation (Version Spatial_Proteomics) [Computer software]. Zenodo.
+> [https://10.5281/zenodo.24304897].
